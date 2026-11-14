@@ -174,12 +174,18 @@ function requirementsFor(clientWire: 'openai' | 'anthropic', body: Json): Requir
 interface AttemptOk {
   ok: true;
   answer: NormalizedAnswer;
+  provider: string;
   model: string;
 }
 
 type Attempt = AttemptOk | { ok: false };
 
-/** Call one candidate. Any refusal, error or unparseable answer is a miss: the sweep moves on. */
+/**
+ * Call one candidate. Any refusal, error, dropped body or unparseable answer
+ * is a miss: the sweep moves on. The body read sits inside the same try as
+ * the fetch, so a connection that dies mid-answer fails over like any other
+ * refusal instead of failing the whole request.
+ */
 async function attempt(
   candidate: Candidate,
   clientWire: 'openai' | 'anthropic',
@@ -198,6 +204,7 @@ async function attempt(
   if (stream) headers.accept = 'text/event-stream';
   callsMade.set(provider.id, (callsMade.get(provider.id) ?? 0) + 1);
   let res: Response;
+  let text: string;
   try {
     res = await fetch(url, {
       method: 'POST',
@@ -205,11 +212,11 @@ async function attempt(
       body: JSON.stringify(call.body),
       signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
     });
+    text = await res.text();
   } catch (err) {
     log(`${provider.id}/${candidate.model.id}: unreachable: ${(err as Error).message}`);
     return { ok: false };
   }
-  const text = await res.text();
   if (!res.ok) {
     log(`${provider.id}/${candidate.model.id}: HTTP ${res.status}: ${text.slice(0, 200)}`);
     return { ok: false };
@@ -219,7 +226,7 @@ async function attempt(
     log(`${provider.id}/${candidate.model.id}: unparseable ${stream ? 'stream' : 'answer'}`);
     return { ok: false };
   }
-  return { ok: true, answer, model: candidate.model.id };
+  return { ok: true, answer, provider: provider.id, model: candidate.model.id };
 }
 
 /** Serve one request: sweep the candidates until one answers, then render it in the client's wire. */
@@ -238,6 +245,7 @@ async function serve(
       if (refused.has(candidate.probe.provider.id)) continue;
       const result = await attempt(candidate, clientWire, body, stream, anthropicVersion);
       if (result.ok) {
+        log(`served by ${result.provider}/${result.model}`);
         const rendered = renderClientAnswer(clientWire, stream, result.answer, result.model);
         return { contentType: rendered.contentType, body: rendered.body, status: 200 };
       }
